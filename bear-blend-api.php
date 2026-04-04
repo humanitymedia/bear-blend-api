@@ -268,166 +268,157 @@ function bb_api_get_customers(WP_REST_Request $request): WP_REST_Response {
 function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
-    // Support both HPOS and legacy post-based orders
-    if (class_exists('Automattic\WooCommerce\Utilities\OrderUtil')
-        && Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled()) {
-        // HPOS path
-        $orders_query = new WC_Order_Query([
-            'limit'   => $per_page,
-            'page'    => $page,
-            'orderby' => 'ID',
-            'order'   => 'ASC',
-            'return'  => 'objects',
-        ]);
-        $orders = $orders_query->get_orders();
+    // Each WC_Order eagerly loads line items, fees, shipping, coupons, refunds, and all
+    // meta — cap at 50 regardless of what the caller requests to avoid OOM on large stores.
+    $per_page = min($per_page, 50);
 
-        // Total count
-        $count_query = new WC_Order_Query([
-            'limit'  => 1,
-            'page'   => 1,
-            'return' => 'ids',
-        ]);
-        $count_query->get_orders();
-        // Fallback: count via wc_get_orders with paginate
-        $count_result = wc_get_orders([
-            'limit'    => 1,
-            'page'     => 1,
-            'paginate' => true,
-        ]);
-        $total = $count_result->total;
-    } else {
-        // Legacy post-based orders
-        $count_result = wc_get_orders([
-            'limit'    => 1,
-            'page'     => 1,
-            'paginate' => true,
-        ]);
-        $total = $count_result->total;
+    // wc_get_orders() works for both HPOS and legacy post-based storage — no need to
+    // branch on OrderUtil. A single paginate=true call gives us the total cheaply.
+    $count_result = wc_get_orders([
+        'limit'    => 1,
+        'page'     => 1,
+        'paginate' => true,
+        'orderby'  => 'ID',
+        'order'    => 'ASC',
+    ]);
+    $total = (int) $count_result->total;
 
-        $orders = wc_get_orders([
-            'limit'   => $per_page,
-            'page'    => $page,
-            'orderby' => 'ID',
-            'order'   => 'ASC',
-        ]);
-    }
+    $orders = wc_get_orders([
+        'limit'   => $per_page,
+        'page'    => $page,
+        'orderby' => 'ID',
+        'order'   => 'ASC',
+    ]);
 
     $items = [];
     foreach ($orders as $order) {
         /** @var WC_Order $order */
 
-        // Line items
-        $line_items = [];
-        foreach ($order->get_items() as $item_id => $item) {
-            /** @var WC_Order_Item_Product $item */
-            $line_items[] = [
-                'id'           => $item_id,
-                'product_id'   => $item->get_product_id(),
-                'variation_id' => $item->get_variation_id(),
-                'name'         => $item->get_name(),
-                'quantity'     => $item->get_quantity(),
-                'subtotal'     => $item->get_subtotal(),
-                'total'        => $item->get_total(),
-                'tax'          => $item->get_total_tax(),
-                'sku'          => $item->get_product() ? $item->get_product()->get_sku() : '',
-                'meta_data'    => $item->get_meta_data(),
+        try {
+            // Line items
+            $line_items = [];
+            foreach ($order->get_items() as $item_id => $item) {
+                /** @var WC_Order_Item_Product $item */
+                $line_items[] = [
+                    'id'           => $item_id,
+                    'product_id'   => $item->get_product_id(),
+                    'variation_id' => $item->get_variation_id(),
+                    'name'         => $item->get_name(),
+                    'quantity'     => $item->get_quantity(),
+                    'subtotal'     => $item->get_subtotal(),
+                    'total'        => $item->get_total(),
+                    'tax'          => $item->get_total_tax(),
+                    'sku'          => $item->get_product() ? $item->get_product()->get_sku() : '',
+                    'meta_data'    => $item->get_meta_data(),
+                ];
+            }
+
+            // Fee lines
+            $fee_lines = [];
+            foreach ($order->get_fees() as $fee_id => $fee) {
+                $fee_lines[] = [
+                    'id'    => $fee_id,
+                    'name'  => $fee->get_name(),
+                    'total' => $fee->get_total(),
+                    'tax'   => $fee->get_total_tax(),
+                ];
+            }
+
+            // Shipping lines
+            $shipping_lines = [];
+            foreach ($order->get_shipping_methods() as $ship_id => $ship) {
+                $shipping_lines[] = [
+                    'id'        => $ship_id,
+                    'method_id' => $ship->get_method_id(),
+                    'name'      => $ship->get_name(),
+                    'total'     => $ship->get_total(),
+                ];
+            }
+
+            // Coupon lines
+            $coupon_lines = [];
+            foreach ($order->get_coupons() as $coupon_id => $coupon) {
+                $coupon_lines[] = [
+                    'id'       => $coupon_id,
+                    'code'     => $coupon->get_code(),
+                    'discount' => $coupon->get_discount(),
+                ];
+            }
+
+            // Refunds
+            $refunds = [];
+            foreach ($order->get_refunds() as $refund) {
+                $refunds[] = [
+                    'id'     => $refund->get_id(),
+                    'amount' => $refund->get_amount(),
+                    'reason' => $refund->get_reason(),
+                    'date'   => $refund->get_date_created()?->format('c'),
+                ];
+            }
+
+            $items[] = [
+                'id'                  => $order->get_id(),
+                'legacy_order_number' => $order->get_meta('_order_number') ?: $order->get_order_number(),
+                'status'              => $order->get_status(),
+                'currency'            => $order->get_currency(),
+                'date_created'        => $order->get_date_created()?->format('c'),
+                'date_modified'       => $order->get_date_modified()?->format('c'),
+                'date_completed'      => $order->get_date_completed()?->format('c'),
+                'date_paid'           => $order->get_date_paid()?->format('c'),
+                'customer_id'         => $order->get_customer_id(),
+                'customer_email'      => $order->get_billing_email(),
+                'billing'             => [
+                    'first_name' => $order->get_billing_first_name(),
+                    'last_name'  => $order->get_billing_last_name(),
+                    'company'    => $order->get_billing_company(),
+                    'address_1'  => $order->get_billing_address_1(),
+                    'address_2'  => $order->get_billing_address_2(),
+                    'city'       => $order->get_billing_city(),
+                    'state'      => $order->get_billing_state(),
+                    'postcode'   => $order->get_billing_postcode(),
+                    'country'    => $order->get_billing_country(),
+                    'email'      => $order->get_billing_email(),
+                    'phone'      => $order->get_billing_phone(),
+                ],
+                'shipping'            => [
+                    'first_name' => $order->get_shipping_first_name(),
+                    'last_name'  => $order->get_shipping_last_name(),
+                    'company'    => $order->get_shipping_company(),
+                    'address_1'  => $order->get_shipping_address_1(),
+                    'address_2'  => $order->get_shipping_address_2(),
+                    'city'       => $order->get_shipping_city(),
+                    'state'      => $order->get_shipping_state(),
+                    'postcode'   => $order->get_shipping_postcode(),
+                    'country'    => $order->get_shipping_country(),
+                ],
+                'payment_method'       => $order->get_payment_method(),
+                'payment_method_title' => $order->get_payment_method_title(),
+                'transaction_id'       => $order->get_transaction_id(),
+                'subtotal'             => $order->get_subtotal(),
+                'total'                => $order->get_total(),
+                'total_tax'            => $order->get_total_tax(),
+                'shipping_total'       => $order->get_shipping_total(),
+                'discount_total'       => $order->get_discount_total(),
+                'line_items'           => $line_items,
+                'fee_lines'            => $fee_lines,
+                'shipping_lines'       => $shipping_lines,
+                'coupon_lines'         => $coupon_lines,
+                'refunds'              => $refunds,
+                'customer_note'        => $order->get_customer_note(),
+                'meta_data'            => $order->get_meta_data(),
             ];
+        } catch (Throwable $e) {
+            // A single malformed order should not crash the entire page.
+            // Record the failure inline so the caller knows which ID to investigate.
+            $items[] = [
+                'id'    => method_exists($order, 'get_id') ? $order->get_id() : null,
+                'error' => $e->getMessage(),
+            ];
+            error_log('bb_api_get_orders: skipped order ' . (method_exists($order, 'get_id') ? $order->get_id() : '?') . ' — ' . $e->getMessage());
         }
 
-        // Fee lines
-        $fee_lines = [];
-        foreach ($order->get_fees() as $fee_id => $fee) {
-            $fee_lines[] = [
-                'id'    => $fee_id,
-                'name'  => $fee->get_name(),
-                'total' => $fee->get_total(),
-                'tax'   => $fee->get_total_tax(),
-            ];
-        }
-
-        // Shipping lines
-        $shipping_lines = [];
-        foreach ($order->get_shipping_methods() as $ship_id => $ship) {
-            $shipping_lines[] = [
-                'id'        => $ship_id,
-                'method_id' => $ship->get_method_id(),
-                'name'      => $ship->get_name(),
-                'total'     => $ship->get_total(),
-            ];
-        }
-
-        // Coupon lines
-        $coupon_lines = [];
-        foreach ($order->get_coupons() as $coupon_id => $coupon) {
-            $coupon_lines[] = [
-                'id'       => $coupon_id,
-                'code'     => $coupon->get_code(),
-                'discount' => $coupon->get_discount(),
-            ];
-        }
-
-        // Refunds
-        $refunds = [];
-        foreach ($order->get_refunds() as $refund) {
-            $refunds[] = [
-                'id'     => $refund->get_id(),
-                'amount' => $refund->get_amount(),
-                'reason' => $refund->get_reason(),
-                'date'   => $refund->get_date_created()?->format('c'),
-            ];
-        }
-
-        $items[] = [
-            'id'                  => $order->get_id(),
-            'legacy_order_number' => $order->get_meta('_order_number') ?: $order->get_order_number(),
-            'status'              => $order->get_status(),
-            'currency'            => $order->get_currency(),
-            'date_created'        => $order->get_date_created()?->format('c'),
-            'date_modified'       => $order->get_date_modified()?->format('c'),
-            'date_completed'      => $order->get_date_completed()?->format('c'),
-            'date_paid'           => $order->get_date_paid()?->format('c'),
-            'customer_id'         => $order->get_customer_id(),
-            'customer_email'      => $order->get_billing_email(),
-            'billing'             => [
-                'first_name' => $order->get_billing_first_name(),
-                'last_name'  => $order->get_billing_last_name(),
-                'company'    => $order->get_billing_company(),
-                'address_1'  => $order->get_billing_address_1(),
-                'address_2'  => $order->get_billing_address_2(),
-                'city'       => $order->get_billing_city(),
-                'state'      => $order->get_billing_state(),
-                'postcode'   => $order->get_billing_postcode(),
-                'country'    => $order->get_billing_country(),
-                'email'      => $order->get_billing_email(),
-                'phone'      => $order->get_billing_phone(),
-            ],
-            'shipping'            => [
-                'first_name' => $order->get_shipping_first_name(),
-                'last_name'  => $order->get_shipping_last_name(),
-                'company'    => $order->get_shipping_company(),
-                'address_1'  => $order->get_shipping_address_1(),
-                'address_2'  => $order->get_shipping_address_2(),
-                'city'       => $order->get_shipping_city(),
-                'state'      => $order->get_shipping_state(),
-                'postcode'   => $order->get_shipping_postcode(),
-                'country'    => $order->get_shipping_country(),
-            ],
-            'payment_method'       => $order->get_payment_method(),
-            'payment_method_title' => $order->get_payment_method_title(),
-            'transaction_id'       => $order->get_transaction_id(),
-            'subtotal'             => $order->get_subtotal(),
-            'total'                => $order->get_total(),
-            'total_tax'            => $order->get_total_tax(),
-            'shipping_total'       => $order->get_shipping_total(),
-            'discount_total'       => $order->get_discount_total(),
-            'line_items'           => $line_items,
-            'fee_lines'            => $fee_lines,
-            'shipping_lines'       => $shipping_lines,
-            'coupon_lines'         => $coupon_lines,
-            'refunds'              => $refunds,
-            'customer_note'        => $order->get_customer_note(),
-            'meta_data'            => $order->get_meta_data(),
-        ];
+        // Release the order object immediately to keep per-page memory flat.
+        unset($order, $line_items, $fee_lines, $shipping_lines, $coupon_lines, $refunds);
     }
 
     return bb_api_paginated_response($items, $total, $page, $per_page);
