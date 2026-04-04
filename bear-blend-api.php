@@ -600,13 +600,40 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response {
         }
     }
 
-    // If using pages, try to find a parent "herbs" page to scope results
+    // Slugs that should never appear in herb results (site utility pages, etc.)
+    $excluded_slugs = [
+        'shop', 'cart', 'checkout', 'contact', 'reviews', 'thankyou',
+        'disclaimer', 'admin-panel', 'bear-blog', 'shopping-cart',
+        'ingredients', 'where-did-it-come-from',
+    ];
+
+    // If using pages, require the parent page whose slug is exactly "herbs".
+    // If that page cannot be found, return nothing rather than dumping all pages.
     $parent_id = 0;
     if ($herb_type === 'page') {
         $herbs_page = get_page_by_path('herbs');
-        if ($herbs_page) {
+        if ($herbs_page && $herbs_page->post_name === 'herbs') {
             $parent_id = $herbs_page->ID;
         }
+
+        if ($parent_id === 0) {
+            return bb_api_paginated_response([], 0, $page, $per_page);
+        }
+    }
+
+    // Resolve excluded slugs to post IDs so WP_Query can filter them out at query time.
+    // This keeps pagination counts accurate.
+    $excluded_ids = [];
+    if (!empty($excluded_slugs)) {
+        global $wpdb;
+        $placeholders = implode(',', array_fill(0, count($excluded_slugs), '%s'));
+        $excluded_ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts} WHERE post_name IN ($placeholders) AND post_type = %s",
+                ...[...$excluded_slugs, $herb_type]
+            )
+        );
+        $excluded_ids = array_map('intval', $excluded_ids);
     }
 
     $query_args = [
@@ -620,6 +647,10 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response {
 
     if ($parent_id > 0) {
         $query_args['post_parent'] = $parent_id;
+    }
+
+    if (!empty($excluded_ids)) {
+        $query_args['post__not_in'] = $excluded_ids;
     }
 
     $query = new WP_Query($query_args);
