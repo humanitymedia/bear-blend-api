@@ -1,0 +1,25 @@
+name: Deploy Plugin: bear-blend-api
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy webhook
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_WEBHOOK_SECRET_BEARBLEND_WP_WORDPRESS_PLUGIN_BEAR_BLEND_API_DEPLOY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"ref":"refs/heads/main"}' \
+            "https://panel.humanitymedia.net/api/deploy/bearblend-wp/wordpress_plugin/bear-blend-api")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          echo "$BODY"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Deploy webhook failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Deploy triggered successfully"
