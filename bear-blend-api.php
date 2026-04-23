@@ -3,7 +3,7 @@
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
  * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
- * Version:     1.1.1
+ * Version:     1.1.2
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -328,7 +328,7 @@ function bb_api_date_query_post_modified(DateTimeImmutable $after): array {
  * REST context that hook doesn't fire, so et_pb_* shortcodes leak through as raw text
  * unless we force the theme's setup routine.
  */
-function bb_api_render_post_content(?string $raw): string {
+function bb_api_render_post_content(?string $raw, ?int $post_id = null): string {
     if ($raw === null || $raw === '') return '';
 
     static $divi_initialized = false;
@@ -345,9 +345,56 @@ function bb_api_render_post_content(?string $raw): string {
         }
     }
 
-    $content = do_blocks($raw);
-    $content = apply_filters('the_content', $content);
-    return str_replace(']]>', ']]&gt;', $content);
+    // Give Divi shortcodes the $GLOBALS['post'] context they expect. Some
+    // Divi modules ([et_pb_shop], product-loop variants) crash without it.
+    $orig_post = $GLOBALS['post'] ?? null;
+    if ($post_id !== null) {
+        $post_obj = get_post($post_id);
+        if ($post_obj) {
+            $GLOBALS['post'] = $post_obj;
+            setup_postdata($post_obj);
+        }
+    }
+
+    // Some Divi/Woo shortcodes call theme helpers that assume a full page
+    // render context — they can fatal in REST land. Try normal rendering;
+    // on any Throwable, fall back to stripping shortcodes so the response
+    // still contains useful text rather than 500ing the whole endpoint.
+    try {
+        $content  = do_blocks($raw);
+        $content  = apply_filters('the_content', $content);
+        $rendered = str_replace(']]>', ']]&gt;', $content);
+    } catch (\Throwable $e) {
+        error_log('[bb-api] render failed for post ' . ($post_id ?? '?') . ': ' . $e->getMessage());
+        $rendered = bb_api_strip_shortcodes($raw);
+    }
+
+    // Restore whatever post context was in place before we meddled.
+    if ($post_id !== null) {
+        if ($orig_post !== null) {
+            $GLOBALS['post'] = $orig_post;
+            setup_postdata($orig_post);
+        } else {
+            unset($GLOBALS['post']);
+            wp_reset_postdata();
+        }
+    }
+
+    return $rendered;
+}
+
+/**
+ * Strip WordPress / Divi shortcode markup from content. Used as the fallback
+ * when full rendering fatals. Preserves inner text, removes shortcode tags,
+ * collapses blank lines.
+ */
+function bb_api_strip_shortcodes(string $content): string {
+    if ($content === '') return '';
+    $content = preg_replace('/\[et_pb_[^\]]*\]/s', '', $content) ?? $content;
+    $content = preg_replace('/\[\/et_pb_[^\]]*\]/s', '', $content) ?? $content;
+    $content = preg_replace('/\[[^\]]*\/?\]/s', '', $content) ?? $content;
+    $content = preg_replace('/\n{3,}/', "\n\n", $content) ?? $content;
+    return trim($content);
 }
 
 
@@ -1180,7 +1227,7 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'           => $post->post_title,
             'slug'            => $post->post_name,
             'status'          => $post->post_status,
-            'content'         => bb_api_render_post_content($post->post_content),
+            'content'         => bb_api_render_post_content($post->post_content, $post->ID),
             'excerpt'         => $post->post_excerpt,
             'date_created'    => $post->post_date,
             'date_modified'   => $post->post_modified,
@@ -1264,7 +1311,7 @@ function bb_api_get_posts(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'           => $post->post_title,
             'slug'            => $post->post_name,
             'status'          => $post->post_status,
-            'content'         => bb_api_render_post_content($post->post_content),
+            'content'         => bb_api_render_post_content($post->post_content, $post->ID),
             'excerpt'         => $post->post_excerpt,
             'author_id'       => (int) $post->post_author,
             'author_name'     => get_the_author_meta('display_name', $post->post_author),
@@ -1394,7 +1441,7 @@ function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response|WP_Error {
         $items[] = [
             'id'             => $post->ID,
             'question'       => $post->post_title,
-            'answer'         => bb_api_render_post_content($post->post_content),
+            'answer'         => bb_api_render_post_content($post->post_content, $post->ID),
             'slug'           => $post->post_name,
             'status'         => $post->post_status,
             'categories'     => $categories,
@@ -1580,7 +1627,7 @@ function bb_api_get_pages(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'          => $post->post_title,
             'slug'           => $post->post_name,
             'status'         => $post->post_status,
-            'content'        => bb_api_render_post_content($post->post_content),
+            'content'        => bb_api_render_post_content($post->post_content, $post->ID),
             'excerpt'        => $post->post_excerpt,
             'parent_id'      => (int) $post->post_parent,
             'menu_order'     => (int) $post->menu_order,
