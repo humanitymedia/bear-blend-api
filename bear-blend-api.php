@@ -3,7 +3,7 @@
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
  * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
- * Version:     1.1.2
+ * Version:     1.1.3
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -357,9 +357,30 @@ function bb_api_render_post_content(?string $raw, ?int $post_id = null): string 
     }
 
     // Some Divi/Woo shortcodes call theme helpers that assume a full page
-    // render context — they can fatal in REST land. Try normal rendering;
-    // on any Throwable, fall back to stripping shortcodes so the response
-    // still contains useful text rather than 500ing the whole endpoint.
+    // render context — they can fatal in REST land, or echo HTML directly
+    // to stdout (product-loop modules especially). We:
+    //   1. Wrap in ob_start so any stray echo goes to a buffer we discard.
+    //   2. Remove shortcodes that misbehave in REST before rendering.
+    //   3. Try/catch so a Throwable falls back to stripped plain text.
+
+    // Shortcodes known to depend on template-loop state that doesn't exist
+    // in REST. Removing them means they render as empty strings — safer
+    // than having them fatal or spew broken HTML into the JSON body.
+    $hostile_shortcodes = [
+        'et_pb_shop', 'et_pb_wc_products', 'et_pb_wc_cart_products',
+        'products', 'recent_products', 'featured_products', 'sale_products',
+        'best_selling_products', 'top_rated_products', 'product_page',
+        'product_categories', 'woocommerce_cart', 'woocommerce_checkout',
+    ];
+    $saved_shortcodes = [];
+    foreach ($hostile_shortcodes as $sc) {
+        if (isset($GLOBALS['shortcode_tags'][$sc])) {
+            $saved_shortcodes[$sc] = $GLOBALS['shortcode_tags'][$sc];
+            remove_shortcode($sc);
+        }
+    }
+
+    ob_start();
     try {
         $content  = do_blocks($raw);
         $content  = apply_filters('the_content', $content);
@@ -367,6 +388,12 @@ function bb_api_render_post_content(?string $raw, ?int $post_id = null): string 
     } catch (\Throwable $e) {
         error_log('[bb-api] render failed for post ' . ($post_id ?? '?') . ': ' . $e->getMessage());
         $rendered = bb_api_strip_shortcodes($raw);
+    }
+    ob_end_clean();
+
+    // Restore the shortcodes we pulled.
+    foreach ($saved_shortcodes as $sc => $cb) {
+        add_shortcode($sc, $cb);
     }
 
     // Restore whatever post context was in place before we meddled.
