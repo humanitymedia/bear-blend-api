@@ -3,7 +3,7 @@
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
  * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
- * Version:     1.1.0
+ * Version:     1.1.1
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -320,6 +320,36 @@ function bb_api_date_query_post_modified(DateTimeImmutable $after): array {
     ];
 }
 
+/**
+ * Render post content into consumable HTML. Handles Gutenberg blocks, Divi shortcodes,
+ * and the standard the_content filter chain (wpautop, wptexturize, do_shortcode, etc.).
+ *
+ * Divi only registers its shortcodes on the 'wp' action during normal page loads; in
+ * REST context that hook doesn't fire, so et_pb_* shortcodes leak through as raw text
+ * unless we force the theme's setup routine.
+ */
+function bb_api_render_post_content(?string $raw): string {
+    if ($raw === null || $raw === '') return '';
+
+    static $divi_initialized = false;
+    if (!$divi_initialized) {
+        $divi_initialized = true;
+        if (function_exists('et_setup_theme')) {
+            et_setup_theme();
+        }
+        if (function_exists('et_builder_init_global_settings')) {
+            et_builder_init_global_settings();
+        }
+        if (function_exists('et_builder_add_main_elements')) {
+            et_builder_add_main_elements();
+        }
+    }
+
+    $content = do_blocks($raw);
+    $content = apply_filters('the_content', $content);
+    return str_replace(']]>', ']]&gt;', $content);
+}
+
 
 // ──────────────────────────────────────────────
 // 4. REGISTER ROUTES
@@ -562,13 +592,13 @@ function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response|WP_Error 
     $modified_after = bb_api_parse_modified_after($request);
     if ($modified_after instanceof WP_Error) return $modified_after;
 
-    $minimal = $request->get_param('fields') === 'minimal';
+    if ($request->get_param('fields') === 'minimal') {
+        return bb_api_get_orders_minimal($request, $page, $per_page, $modified_after);
+    }
 
     // Full-order responses eagerly load line items, fees, shipping, coupons, refunds, and
-    // meta — cap at 50 to avoid OOM. Minimal mode is cheap and can respect the full 100.
-    if (!$minimal) {
-        $per_page = min($per_page, 50);
-    }
+    // meta — cap at 50 to avoid OOM.
+    $per_page = min($per_page, 50);
 
     $count_args = [
         'limit'    => 1,
@@ -600,19 +630,6 @@ function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response|WP_Error 
     $items = [];
     foreach ($orders as $order) {
         /** @var WC_Order $order */
-
-        if ($minimal) {
-            // Bypass line-item / fee / refund loops entirely — pull scalar props only.
-            $items[] = [
-                'id'            => $order->get_id(),
-                'status'        => $order->get_status(),
-                'date_modified' => $order->get_date_modified()?->format('c'),
-                'total'         => $order->get_total(),
-                'customer_id'   => $order->get_customer_id(),
-            ];
-            unset($order);
-            continue;
-        }
 
         try {
             // Line items
@@ -739,6 +756,118 @@ function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response|WP_Error 
 
         // Release the order object immediately to keep per-page memory flat.
         unset($order, $line_items, $fee_lines, $shipping_lines, $coupon_lines, $refunds);
+    }
+
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
+}
+
+/**
+ * Fast path for ?fields=minimal. Queries the HPOS table (or wp_posts + postmeta fallback)
+ * directly, skipping WC_Order hydration entirely. Target is 10x+ faster than full mode.
+ */
+function bb_api_get_orders_minimal(
+    WP_REST_Request $request,
+    int $page,
+    int $per_page,
+    DateTimeImmutable|WP_Error|null $modified_after
+): WP_REST_Response {
+    global $wpdb;
+
+    $offset = ($page - 1) * $per_page;
+    $hpos   = class_exists('\Automattic\WooCommerce\Utilities\OrderUtil')
+        && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+
+    $tz_site = wp_timezone();
+
+    if ($hpos) {
+        $table = $wpdb->prefix . 'wc_orders';
+
+        $where = ['type = %s'];
+        $args  = ['shop_order'];
+        if ($modified_after instanceof DateTimeImmutable) {
+            $where[] = 'date_updated_gmt > %s';
+            $args[]  = $modified_after->format('Y-m-d H:i:s');
+        }
+        $where_sql = 'WHERE ' . implode(' AND ', $where);
+
+        $total = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM {$table} {$where_sql}",
+            ...$args
+        ));
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, status, date_updated_gmt, total_amount, customer_id
+             FROM {$table}
+             {$where_sql}
+             ORDER BY id ASC
+             LIMIT %d OFFSET %d",
+            ...[...$args, $per_page, $offset]
+        ), ARRAY_A);
+
+        $items = [];
+        foreach ($rows ?: [] as $row) {
+            $dt_modified = null;
+            if (!empty($row['date_updated_gmt']) && $row['date_updated_gmt'] !== '0000-00-00 00:00:00') {
+                $dt_modified = (new DateTimeImmutable($row['date_updated_gmt'], new DateTimeZone('UTC')))
+                    ->setTimezone($tz_site)
+                    ->format('c');
+            }
+            $items[] = [
+                'id'            => (int) $row['id'],
+                // HPOS stores statuses with or without the wc- prefix depending on version.
+                'status'        => preg_replace('/^wc-/', '', (string) $row['status']),
+                'date_modified' => $dt_modified,
+                'total'         => $row['total_amount'] !== null ? (string) $row['total_amount'] : '0',
+                'customer_id'   => (int) $row['customer_id'],
+            ];
+        }
+    } else {
+        // Legacy wp_posts storage. A single LEFT JOIN per meta key keeps this index-friendly.
+        $where = ["p.post_type = 'shop_order'", "p.post_status NOT IN ('trash','auto-draft')"];
+        $args  = [];
+        if ($modified_after instanceof DateTimeImmutable) {
+            $where[] = 'p.post_modified_gmt > %s';
+            $args[]  = $modified_after->format('Y-m-d H:i:s');
+        }
+        $where_sql = 'WHERE ' . implode(' AND ', $where);
+
+        $total_sql = "SELECT COUNT(*) FROM {$wpdb->posts} p {$where_sql}";
+        $total     = (int) (empty($args) ? $wpdb->get_var($total_sql) : $wpdb->get_var($wpdb->prepare($total_sql, ...$args)));
+
+        $list_sql = "SELECT p.ID as id, p.post_status as status, p.post_modified_gmt as date_modified_gmt,
+                            pm_total.meta_value as total, pm_cust.meta_value as customer_id
+                     FROM {$wpdb->posts} p
+                     LEFT JOIN {$wpdb->postmeta} pm_total ON pm_total.post_id = p.ID AND pm_total.meta_key = '_order_total'
+                     LEFT JOIN {$wpdb->postmeta} pm_cust  ON pm_cust.post_id  = p.ID AND pm_cust.meta_key  = '_customer_user'
+                     {$where_sql}
+                     ORDER BY p.ID ASC
+                     LIMIT %d OFFSET %d";
+        $list_args = [...$args, $per_page, $offset];
+        $rows = $wpdb->get_results($wpdb->prepare($list_sql, ...$list_args), ARRAY_A);
+
+        $items = [];
+        foreach ($rows ?: [] as $row) {
+            $dt_modified = null;
+            if (!empty($row['date_modified_gmt']) && $row['date_modified_gmt'] !== '0000-00-00 00:00:00') {
+                $dt_modified = (new DateTimeImmutable($row['date_modified_gmt'], new DateTimeZone('UTC')))
+                    ->setTimezone($tz_site)
+                    ->format('c');
+            }
+            $items[] = [
+                'id'            => (int) $row['id'],
+                'status'        => preg_replace('/^wc-/', '', (string) $row['status']),
+                'date_modified' => $dt_modified,
+                'total'         => $row['total'] !== null ? (string) $row['total'] : '0',
+                'customer_id'   => (int) $row['customer_id'],
+            ];
+        }
     }
 
     return bb_api_paginated_response(
@@ -950,9 +1079,25 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
     // If that page cannot be found, return nothing rather than dumping all pages.
     $parent_id = 0;
     if ($herb_type === 'page') {
+        // get_page_by_path() only matches published pages with post_parent=0 by default.
+        // On live, the herbs page was either nested, non-published, or the cache was cold —
+        // so we fall back to a direct wpdb lookup that tolerates any non-trash status and
+        // ranks 'publish' first when multiple candidates exist.
         $herbs_page = get_page_by_path('herbs');
         if ($herbs_page && $herbs_page->post_name === 'herbs') {
             $parent_id = $herbs_page->ID;
+        }
+
+        if ($parent_id === 0) {
+            global $wpdb;
+            $parent_id = (int) $wpdb->get_var(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE post_name = 'herbs'
+                   AND post_type = 'page'
+                   AND post_status NOT IN ('trash','auto-draft')
+                 ORDER BY (post_status = 'publish') DESC, ID ASC
+                 LIMIT 1"
+            );
         }
 
         if ($parent_id === 0) {
@@ -1035,7 +1180,7 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'           => $post->post_title,
             'slug'            => $post->post_name,
             'status'          => $post->post_status,
-            'content'         => $post->post_content,
+            'content'         => bb_api_render_post_content($post->post_content),
             'excerpt'         => $post->post_excerpt,
             'date_created'    => $post->post_date,
             'date_modified'   => $post->post_modified,
@@ -1119,7 +1264,7 @@ function bb_api_get_posts(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'           => $post->post_title,
             'slug'            => $post->post_name,
             'status'          => $post->post_status,
-            'content'         => $post->post_content,
+            'content'         => bb_api_render_post_content($post->post_content),
             'excerpt'         => $post->post_excerpt,
             'author_id'       => (int) $post->post_author,
             'author_name'     => get_the_author_meta('display_name', $post->post_author),
@@ -1249,7 +1394,7 @@ function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response|WP_Error {
         $items[] = [
             'id'             => $post->ID,
             'question'       => $post->post_title,
-            'answer'         => apply_filters('the_content', $post->post_content),
+            'answer'         => bb_api_render_post_content($post->post_content),
             'slug'           => $post->post_name,
             'status'         => $post->post_status,
             'categories'     => $categories,
@@ -1342,7 +1487,20 @@ function bb_api_get_counts(WP_REST_Request $request): WP_REST_Response {
         'subscriptions'       => $subscriptions_total,
     ];
 
-    return new WP_REST_Response($data);
+    // ETag over the payload lets pollers cheaply detect "no change since last sync" —
+    // key order is stable because we assemble the array literally.
+    $etag     = md5((string) wp_json_encode($data));
+    $response = new WP_REST_Response($data);
+    $response->header('ETag', '"' . $etag . '"');
+    $response->header('Cache-Control', 'private, max-age=0, must-revalidate');
+
+    $client_etag = $request->get_header('If-None-Match');
+    if ($client_etag !== null && trim($client_etag, " \t\"") === $etag) {
+        $response->set_data(null);
+        $response->set_status(304);
+    }
+
+    return $response;
 }
 
 
@@ -1422,8 +1580,7 @@ function bb_api_get_pages(WP_REST_Request $request): WP_REST_Response|WP_Error {
             'title'          => $post->post_title,
             'slug'           => $post->post_name,
             'status'         => $post->post_status,
-            // Resolve shortcodes/Divi so the consumer gets renderable HTML.
-            'content'        => apply_filters('the_content', $post->post_content),
+            'content'        => bb_api_render_post_content($post->post_content),
             'excerpt'        => $post->post_excerpt,
             'parent_id'      => (int) $post->post_parent,
             'menu_order'     => (int) $post->menu_order,
