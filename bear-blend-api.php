@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
- * Description: Read-only REST API endpoints for migrating Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, and posts — all paginated and protected by a Bearer token.
- * Version:     1.0.3
+ * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
+ * Version:     1.1.0
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -59,18 +59,25 @@ function bb_api_settings_page(): void {
         </form>
         <hr>
         <h2>Available Endpoints</h2>
-        <table class="widefat fixed striped" style="max-width:700px">
+        <table class="widefat fixed striped" style="max-width:760px">
             <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
             <tbody>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/counts</code></td><td>Record counts per resource type (sync completeness check)</td></tr>
                 <tr><td>GET</td><td><code>/wp-json/bb/v1/customers</code></td><td>WP users with meta &amp; roles</td></tr>
-                <tr><td>GET</td><td><code>/wp-json/bb/v1/orders</code></td><td>WooCommerce orders with line items</td></tr>
-                <tr><td>GET</td><td><code>/wp-json/bb/v1/products</code></td><td>Products, variations, categories, reviews</td></tr>
-                <tr><td>GET</td><td><code>/wp-json/bb/v1/herbs</code></td><td>Herb content pages with custom fields</td></tr>
-                <tr><td>GET</td><td><code>/wp-json/bb/v1/posts</code></td><td>Blog posts with images &amp; categories</td></tr>
-                <tr><td>GET</td><td><code>/wp-json/bb/v1/faqs</code></td><td>FAQ entries with categories &amp; ACF fields</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/orders</code></td><td>WooCommerce orders with line items (<code>?fields=minimal</code> for cheap mode)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/products</code></td><td>Products, variations, categories, reviews, AIOSEO</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/herbs</code></td><td>Herb content pages with custom fields + AIOSEO</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/posts</code></td><td>Blog posts with images, categories, AIOSEO</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/pages</code></td><td>Static pages (About, Contact, etc.) with AIOSEO</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/faqs</code></td><td>FAQ entries with categories, ACF fields, AIOSEO</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/menus</code></td><td>All WP nav menus + menu locations (single request)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/media</code></td><td>Media library with alt, caption, dimensions, filesize</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/terms</code></td><td>Taxonomy terms with descriptions &amp; AIOSEO (<code>?taxonomy=</code> required)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/coupons</code></td><td>WooCommerce coupons with restrictions &amp; usage counts</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/aioseo/{post_type}/{id}</code></td><td>Direct AIOSEO row lookup for a single post (optional helper)</td></tr>
             </tbody>
         </table>
-        <p>All endpoints accept <code>?page=1&per_page=50</code> query params and return <code>X-WP-Total</code> / <code>X-WP-TotalPages</code> headers.</p>
+        <p>All list endpoints accept <code>?page=1&amp;per_page=50</code> and <code>?modified_after=&lt;ISO 8601 UTC&gt;</code> for incremental sync. Paginated responses return <code>X-WP-Total</code>, <code>X-WP-TotalPages</code>, <code>Last-Modified</code>, and <code>ETag</code> headers; send <code>If-None-Match</code> to get a <code>304 Not Modified</code>.</p>
     </div>
     <?php
 }
@@ -122,11 +129,34 @@ function bb_api_pagination_args(WP_REST_Request $request): array {
     return ['page' => $page, 'per_page' => $per_page];
 }
 
-function bb_api_paginated_response(array $items, int $total, int $page, int $per_page): WP_REST_Response {
+function bb_api_paginated_response(
+    array $items,
+    int $total,
+    int $page,
+    int $per_page,
+    ?WP_REST_Request $request = null,
+    ?string $last_modified = null
+): WP_REST_Response {
     $response = new WP_REST_Response($items);
     $response->header('X-WP-Total', $total);
-    $response->header('X-WP-TotalPages', (int) ceil($total / $per_page));
+    $response->header('X-WP-TotalPages', $per_page > 0 ? (int) ceil($total / $per_page) : 0);
     $response->header('X-WP-Page', $page);
+
+    if ($request !== null && !empty($last_modified)) {
+        $ts = strtotime($last_modified);
+        if ($ts !== false) {
+            $etag = md5($last_modified . '|' . $page . '|' . $per_page . '|' . $total);
+            $response->header('Last-Modified', gmdate('D, d M Y H:i:s', $ts) . ' GMT');
+            $response->header('ETag', '"' . $etag . '"');
+
+            $client_etag = $request->get_header('If-None-Match');
+            if ($client_etag !== null && trim($client_etag, " \t\"") === $etag) {
+                $response->set_data(null);
+                $response->set_status(304);
+            }
+        }
+    }
+
     return $response;
 }
 
@@ -151,6 +181,145 @@ function bb_api_pagination_params(): array {
     ];
 }
 
+/**
+ * Pagination + modified_after schema. Used by every list endpoint.
+ */
+function bb_api_list_params(): array {
+    return array_merge(bb_api_pagination_params(), [
+        'modified_after' => [
+            'description' => 'ISO 8601 datetime (interpreted as UTC). Returns only records modified strictly after this time.',
+            'type'        => 'string',
+        ],
+    ]);
+}
+
+
+// ──────────────────────────────────────────────
+// 3b. INCREMENTAL SYNC + AIOSEO HELPERS
+// ──────────────────────────────────────────────
+
+/**
+ * Parse ?modified_after from the request. Returns a DateTimeImmutable (UTC), null if absent,
+ * or WP_Error on malformed input.
+ */
+function bb_api_parse_modified_after(WP_REST_Request $request): DateTimeImmutable|WP_Error|null {
+    $raw = $request->get_param('modified_after');
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+
+    try {
+        $dt = new DateTimeImmutable((string) $raw, new DateTimeZone('UTC'));
+    } catch (Throwable $e) {
+        return new WP_Error(
+            'bb_api_invalid_modified_after',
+            'modified_after must be an ISO 8601 datetime string. ' . $e->getMessage(),
+            ['status' => 400]
+        );
+    }
+
+    return $dt->setTimezone(new DateTimeZone('UTC'));
+}
+
+/**
+ * Bulk-fetch AIOSEO rows for a set of post IDs, returned as [post_id => formatted_row].
+ * Null-safe: returns [] if AIOSEO is deactivated or the table doesn't exist.
+ */
+function bb_api_fetch_aioseo_for_posts(array $post_ids): array {
+    $post_ids = array_values(array_unique(array_filter(array_map('intval', $post_ids))));
+    if (empty($post_ids)) {
+        return [];
+    }
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'aioseo_posts';
+
+    $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+    if ($exists !== $table) {
+        return [];
+    }
+
+    $placeholders = implode(',', array_fill(0, count($post_ids), '%d'));
+    $rows = $wpdb->get_results(
+        $wpdb->prepare("SELECT * FROM $table WHERE post_id IN ($placeholders)", ...$post_ids),
+        ARRAY_A
+    );
+
+    $map = [];
+    foreach ($rows ?: [] as $row) {
+        $map[(int) $row['post_id']] = bb_api_format_aioseo_row($row);
+    }
+    return $map;
+}
+
+/**
+ * Shape a raw wp_aioseo_posts row into the public response format. JSON columns are decoded.
+ */
+function bb_api_format_aioseo_row(array $row): array {
+    $decode = function ($val) {
+        if (!is_string($val) || $val === '') {
+            return null;
+        }
+        $decoded = json_decode($val, true);
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : $val;
+    };
+
+    $keyphrases      = $decode($row['keyphrases'] ?? null);
+    $focus_keyphrase = '';
+    if (is_array($keyphrases) && isset($keyphrases['focus']['keyphrase'])) {
+        $focus_keyphrase = (string) $keyphrases['focus']['keyphrase'];
+    }
+
+    return [
+        'post_id'             => (int) ($row['post_id'] ?? 0),
+        'post_type'           => $row['post_type'] ?? null,
+        'title'               => $row['title'] ?? null,
+        'description'         => $row['description'] ?? null,
+        'canonical_url'       => $row['canonical_url'] ?? null,
+        'og_title'            => $row['og_title'] ?? null,
+        'og_description'      => $row['og_description'] ?? null,
+        'og_image_url'        => $row['og_image_url'] ?? null,
+        'twitter_title'       => $row['twitter_title'] ?? null,
+        'twitter_description' => $row['twitter_description'] ?? null,
+        'twitter_image_url'   => $row['twitter_image_url'] ?? null,
+        'robots_noindex'      => (int) ($row['robots_noindex'] ?? 0),
+        'robots_nofollow'     => (int) ($row['robots_nofollow'] ?? 0),
+        'robots_default'      => (int) ($row['robots_default'] ?? 1),
+        'schema_type'         => $row['schema_type'] ?? null,
+        'schema_type_options' => $decode($row['schema_type_options'] ?? null),
+        'keyphrases'          => $keyphrases,
+        'focus_keyphrase'     => $focus_keyphrase,
+    ];
+}
+
+/**
+ * Extract the max value of $key across a list of items. Returns null if none found.
+ * Used to compute Last-Modified / ETag values.
+ */
+function bb_api_max_modified(array $items, string $key): ?string {
+    $max = '';
+    foreach ($items as $item) {
+        $v = $item[$key] ?? null;
+        if (is_string($v) && $v > $max) {
+            $max = $v;
+        }
+    }
+    return $max === '' ? null : $max;
+}
+
+/**
+ * Build a WP_Query date_query clause for post_modified_gmt > $after.
+ */
+function bb_api_date_query_post_modified(DateTimeImmutable $after): array {
+    return [
+        [
+            'column'    => 'post_modified_gmt',
+            'after'     => $after->format('Y-m-d H:i:s'),
+            'inclusive' => false,
+        ],
+    ];
+}
+
 
 // ──────────────────────────────────────────────
 // 4. REGISTER ROUTES
@@ -160,23 +329,121 @@ add_action('rest_api_init', function () {
 
     $ns = 'bb/v1';
 
-    $endpoints = [
+    // Simple list endpoints that take only pagination + modified_after.
+    $list_endpoints = [
         'customers' => 'bb_api_get_customers',
-        'orders'    => 'bb_api_get_orders',
         'products'  => 'bb_api_get_products',
         'herbs'     => 'bb_api_get_herbs',
         'posts'     => 'bb_api_get_posts',
         'faqs'      => 'bb_api_get_faqs',
     ];
 
-    foreach ($endpoints as $route => $callback) {
+    foreach ($list_endpoints as $route => $callback) {
         register_rest_route($ns, '/' . $route, [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => $callback,
             'permission_callback' => 'bb_api_check_auth',
-            'args'                => bb_api_pagination_params(),
+            'args'                => bb_api_list_params(),
         ]);
     }
+
+    // Orders — adds ?fields=minimal.
+    register_rest_route($ns, '/orders', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_orders',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => array_merge(bb_api_list_params(), [
+            'fields' => [
+                'description' => 'Pass "minimal" to return only id/status/date_modified/total/customer_id.',
+                'type'        => 'string',
+                'enum'        => ['minimal'],
+            ],
+        ]),
+    ]);
+
+    // Counts — no pagination, no modified_after.
+    register_rest_route($ns, '/counts', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_counts',
+        'permission_callback' => 'bb_api_check_auth',
+    ]);
+
+    // Pages — adds include_drafts + exclude_slugs.
+    register_rest_route($ns, '/pages', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_pages',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => array_merge(bb_api_list_params(), [
+            'include_drafts' => [
+                'description' => 'If true, include draft/pending/private/future pages alongside publish.',
+                'type'        => 'boolean',
+                'default'     => false,
+            ],
+            'exclude_slugs' => [
+                'description' => 'Comma-separated list of page slugs to exclude (adds to built-in utility exclusions).',
+                'type'        => 'string',
+            ],
+        ]),
+    ]);
+
+    // Menus — unpaginated.
+    register_rest_route($ns, '/menus', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_menus',
+        'permission_callback' => 'bb_api_check_auth',
+    ]);
+
+    // Media — adds mime_type.
+    register_rest_route($ns, '/media', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_media',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => array_merge(bb_api_list_params(), [
+            'mime_type' => [
+                'description' => 'Filter by MIME type, e.g. "image/jpeg".',
+                'type'        => 'string',
+            ],
+        ]),
+    ]);
+
+    // Terms — taxonomy required.
+    register_rest_route($ns, '/terms', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_terms',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => array_merge(bb_api_list_params(), [
+            'taxonomy' => [
+                'description' => 'Taxonomy slug, e.g. "product_cat", "product_tag", "category", "post_tag".',
+                'type'        => 'string',
+                'required'    => true,
+            ],
+        ]),
+    ]);
+
+    // Coupons — adds status.
+    register_rest_route($ns, '/coupons', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_coupons',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => array_merge(bb_api_list_params(), [
+            'status' => [
+                'description' => 'Post status filter. Defaults to "publish".',
+                'type'        => 'string',
+                'default'     => 'publish',
+            ],
+        ]),
+    ]);
+
+    // AIOSEO direct lookup for a single post.
+    register_rest_route($ns, '/aioseo/(?P<post_type>[a-z0-9_-]+)/(?P<id>\d+)', [
+        'methods'             => WP_REST_Server::READABLE,
+        'callback'            => 'bb_api_get_aioseo_for_post',
+        'permission_callback' => 'bb_api_check_auth',
+        'args'                => [
+            'post_type' => ['type' => 'string', 'required' => true],
+            'id'        => ['type' => 'integer', 'required' => true, 'minimum' => 1],
+        ],
+    ]);
 });
 
 
@@ -186,15 +453,32 @@ add_action('rest_api_init', function () {
 
 // ── CUSTOMERS ────────────────────────────────
 
-function bb_api_get_customers(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_customers(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
-    $user_query = new WP_User_Query([
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $query_args = [
         'number'  => $per_page,
         'paged'   => $page,
         'orderby' => 'ID',
         'order'   => 'ASC',
-    ]);
+    ];
+
+    // WP_User_Query's date_query filters against user_registered. Per spec, users have no
+    // native "last modified" timestamp; a later release may backfill _last_synced_at.
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = [
+            [
+                'column'    => 'user_registered',
+                'after'     => $modified_after->format('Y-m-d H:i:s'),
+                'inclusive' => false,
+            ],
+        ];
+    }
+
+    $user_query = new WP_User_Query($query_args);
 
     $total = $user_query->get_total();
     $users = [];
@@ -259,40 +543,76 @@ function bb_api_get_customers(WP_REST_Request $request): WP_REST_Response {
         ];
     }
 
-    return bb_api_paginated_response($users, $total, $page, $per_page);
+    return bb_api_paginated_response(
+        $users,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($users, 'registered')
+    );
 }
 
 
 // ── ORDERS ───────────────────────────────────
 
-function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
-    // Each WC_Order eagerly loads line items, fees, shipping, coupons, refunds, and all
-    // meta — cap at 50 regardless of what the caller requests to avoid OOM on large stores.
-    $per_page = min($per_page, 50);
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
 
-    // wc_get_orders() works for both HPOS and legacy post-based storage — no need to
-    // branch on OrderUtil. A single paginate=true call gives us the total cheaply.
-    $count_result = wc_get_orders([
+    $minimal = $request->get_param('fields') === 'minimal';
+
+    // Full-order responses eagerly load line items, fees, shipping, coupons, refunds, and
+    // meta — cap at 50 to avoid OOM. Minimal mode is cheap and can respect the full 100.
+    if (!$minimal) {
+        $per_page = min($per_page, 50);
+    }
+
+    $count_args = [
         'limit'    => 1,
         'page'     => 1,
         'paginate' => true,
         'orderby'  => 'ID',
         'order'    => 'ASC',
-    ]);
-    $total = (int) $count_result->total;
-
-    $orders = wc_get_orders([
+    ];
+    $list_args = [
         'limit'   => $per_page,
         'page'    => $page,
         'orderby' => 'ID',
         'order'   => 'ASC',
-    ]);
+    ];
+
+    if ($modified_after instanceof DateTimeImmutable) {
+        // wc_get_orders supports a `>` / `>=` prefix on date_modified. Passing '>' + ISO
+        // string mirrors post_modified_gmt > modified_after across HPOS and legacy stores.
+        $filter = '>' . $modified_after->format('Y-m-d\TH:i:s');
+        $count_args['date_modified'] = $filter;
+        $list_args['date_modified']  = $filter;
+    }
+
+    $count_result = wc_get_orders($count_args);
+    $total        = (int) $count_result->total;
+
+    $orders = wc_get_orders($list_args);
 
     $items = [];
     foreach ($orders as $order) {
         /** @var WC_Order $order */
+
+        if ($minimal) {
+            // Bypass line-item / fee / refund loops entirely — pull scalar props only.
+            $items[] = [
+                'id'            => $order->get_id(),
+                'status'        => $order->get_status(),
+                'date_modified' => $order->get_date_modified()?->format('c'),
+                'total'         => $order->get_total(),
+                'customer_id'   => $order->get_customer_id(),
+            ];
+            unset($order);
+            continue;
+        }
 
         try {
             // Line items
@@ -421,26 +741,43 @@ function bb_api_get_orders(WP_REST_Request $request): WP_REST_Response {
         unset($order, $line_items, $fee_lines, $shipping_lines, $coupon_lines, $refunds);
     }
 
-    return bb_api_paginated_response($items, $total, $page, $per_page);
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
 }
 
 
 // ── PRODUCTS ─────────────────────────────────
 
-function bb_api_get_products(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_products(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
-    $query = new WP_Query([
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $query_args = [
         'post_type'      => 'product',
         'post_status'    => 'any',
         'posts_per_page' => $per_page,
         'paged'          => $page,
         'orderby'        => 'ID',
         'order'          => 'ASC',
-    ]);
+    ];
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
 
     $total = $query->found_posts;
     $items = [];
+
+    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
 
     foreach ($query->posts as $post) {
         $product = wc_get_product($post->ID);
@@ -564,19 +901,30 @@ function bb_api_get_products(WP_REST_Request $request): WP_REST_Response {
             'attributes'       => $attributes,
             'variations'       => $variations,
             'reviews'          => $reviews,
+            'aioseo'           => $aioseo_map[$post->ID] ?? null,
             'meta_data'        => get_post_meta($post->ID),
         ];
     }
 
     wp_reset_postdata();
-    return bb_api_paginated_response($items, $total, $page, $per_page);
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
 }
 
 
 // ── HERBS ────────────────────────────────────
 
-function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
 
     // Herbs may be stored as a custom post type or as pages — try both
     $post_types = ['herb', 'herbs'];
@@ -644,9 +992,15 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response {
         $query_args['post__not_in'] = $excluded_ids;
     }
 
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
     $query = new WP_Query($query_args);
     $total = $query->found_posts;
     $items = [];
+
+    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
 
     foreach ($query->posts as $post) {
         $all_meta    = get_post_meta($post->ID);
@@ -688,31 +1042,49 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response {
             'featured_image'  => ['id' => $featured_id, 'url' => $featured_url],
             'acf_fields'      => $acf_fields,
             'taxonomies'      => $taxonomies,
+            'aioseo'          => $aioseo_map[$post->ID] ?? null,
             'meta'            => $flat_meta,
         ];
     }
 
     wp_reset_postdata();
-    return bb_api_paginated_response($items, $total, $page, $per_page);
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
 }
 
 
 // ── POSTS ────────────────────────────────────
 
-function bb_api_get_posts(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_posts(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
-    $query = new WP_Query([
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $query_args = [
         'post_type'      => 'post',
         'post_status'    => 'any',
         'posts_per_page' => $per_page,
         'paged'          => $page,
         'orderby'        => 'ID',
         'order'          => 'ASC',
-    ]);
+    ];
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
 
     $total = $query->found_posts;
     $items = [];
+
+    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
 
     foreach ($query->posts as $post) {
         $featured_id  = get_post_thumbnail_id($post->ID);
@@ -759,19 +1131,30 @@ function bb_api_get_posts(WP_REST_Request $request): WP_REST_Response {
             'content_images'  => $content_images,
             'comment_status'  => $post->comment_status,
             'comment_count'   => (int) $post->comment_count,
+            'aioseo'          => $aioseo_map[$post->ID] ?? null,
             'meta'            => get_post_meta($post->ID),
         ];
     }
 
     wp_reset_postdata();
-    return bb_api_paginated_response($items, $total, $page, $per_page);
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
 }
 
 
 // ── FAQS ─────────────────────────────────────
 
-function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response {
+function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
 
     // Auto-detect registered FAQ post type
     $candidates  = ['faq', 'faqs'];
@@ -792,17 +1175,24 @@ function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response {
         ], 404);
     }
 
-    $query = new WP_Query([
+    $query_args = [
         'post_type'      => $faq_type,
         'post_status'    => 'any',
         'posts_per_page' => $per_page,
         'paged'          => $page,
         'orderby'        => 'ID',
         'order'          => 'ASC',
-    ]);
+    ];
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
 
     $total = $query->found_posts;
     $items = [];
+
+    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
 
     // Discover FAQ-related taxonomies (category-like) for this post type
     $faq_taxonomies = get_object_taxonomies($faq_type, 'objects');
@@ -866,10 +1256,515 @@ function bb_api_get_faqs(WP_REST_Request $request): WP_REST_Response {
             'meta'           => $flat_meta,
             'acf'            => $acf_fields,
             'featured_image' => $featured_url,
+            'aioseo'         => $aioseo_map[$post->ID] ?? null,
             'published_at'   => (new DateTimeImmutable($post->post_date))->format('c'),
+            'date_modified'  => $post->post_modified,
         ];
     }
 
     wp_reset_postdata();
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
+}
+
+
+// ── COUNTS ───────────────────────────────────
+
+function bb_api_get_counts(WP_REST_Request $request): WP_REST_Response {
+    // Sum all non-trash/auto-draft statuses. Inherit is only meaningful for attachments —
+    // wp_count_posts('attachment')->inherit is the published media count, included below.
+    $sum_statuses = function (string $post_type, array $statuses): int {
+        $counts = wp_count_posts($post_type);
+        $total  = 0;
+        foreach ($statuses as $s) {
+            $total += (int) ($counts->$s ?? 0);
+        }
+        return $total;
+    };
+
+    $active_statuses = ['publish', 'draft', 'private', 'pending', 'future'];
+
+    // Orders via wc_get_orders paginate — works for HPOS + legacy.
+    $orders_total = 0;
+    if (function_exists('wc_get_orders')) {
+        $orders_total = (int) wc_get_orders([
+            'limit'    => 1,
+            'page'     => 1,
+            'paginate' => true,
+        ])->total;
+    }
+
+    $registered = get_post_types([], 'names');
+    $faq_type   = in_array('faq', $registered, true) ? 'faq' : (in_array('faqs', $registered, true) ? 'faqs' : null);
+    $herb_type  = in_array('herb', $registered, true) ? 'herb' : (in_array('herbs', $registered, true) ? 'herbs' : null);
+
+    $users_total = (int) (count_users()['total_users'] ?? 0);
+
+    $reviews_total = (int) get_comments([
+        'type'   => 'review',
+        'status' => 'approve',
+        'count'  => true,
+    ]);
+
+    $subscriptions_total = in_array('shop_subscription', $registered, true)
+        ? $sum_statuses('shop_subscription', $active_statuses)
+        : 0;
+
+    $count_terms = function (string $taxonomy): int {
+        if (!taxonomy_exists($taxonomy)) return 0;
+        $count = wp_count_terms(['taxonomy' => $taxonomy, 'hide_empty' => false]);
+        return is_wp_error($count) ? 0 : (int) $count;
+    };
+
+    $data = [
+        'customers'           => $users_total,
+        'orders'              => $orders_total,
+        'products'            => $sum_statuses('product', $active_statuses),
+        'product_variations'  => $sum_statuses('product_variation', ['publish', 'private']),
+        'posts'               => $sum_statuses('post', $active_statuses),
+        'pages'               => $sum_statuses('page', $active_statuses),
+        'faqs'                => $faq_type ? $sum_statuses($faq_type, $active_statuses) : 0,
+        'herbs'               => $herb_type ? $sum_statuses($herb_type, $active_statuses) : 0,
+        'coupons'             => $sum_statuses('shop_coupon', $active_statuses),
+        'menus'               => $count_terms('nav_menu'),
+        'media'               => (int) (wp_count_posts('attachment')->inherit ?? 0),
+        'product_categories'  => $count_terms('product_cat'),
+        'product_tags'        => $count_terms('product_tag'),
+        'post_categories'     => $count_terms('category'),
+        'post_tags'           => $count_terms('post_tag'),
+        'reviews'             => $reviews_total,
+        'subscriptions'       => $subscriptions_total,
+    ];
+
+    return new WP_REST_Response($data);
+}
+
+
+// ── PAGES ────────────────────────────────────
+
+function bb_api_get_pages(WP_REST_Request $request): WP_REST_Response|WP_Error {
+    ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $include_drafts = filter_var($request->get_param('include_drafts'), FILTER_VALIDATE_BOOLEAN);
+
+    // Always-excluded utility slugs. Callers can extend via ?exclude_slugs=a,b,c.
+    $excluded_slugs = ['shop', 'cart', 'checkout', 'my-account', 'thank-you'];
+    $extra_exclude  = $request->get_param('exclude_slugs');
+    if (!empty($extra_exclude)) {
+        foreach (explode(',', (string) $extra_exclude) as $slug) {
+            $slug = trim($slug);
+            if ($slug !== '') $excluded_slugs[] = $slug;
+        }
+    }
+
+    global $wpdb;
+    // Resolve exact-slug exclusions + wildcard prefixes (wpforms-*, funnel-*) to IDs so
+    // WP_Query filters them at query time and pagination totals stay accurate.
+    $exclude_ids = [];
+    if (!empty($excluded_slugs)) {
+        $placeholders = implode(',', array_fill(0, count($excluded_slugs), '%s'));
+        $exclude_ids  = $wpdb->get_col($wpdb->prepare(
+            "SELECT ID FROM {$wpdb->posts} WHERE post_type = 'page' AND post_name IN ($placeholders)",
+            ...$excluded_slugs
+        ));
+    }
+    $wildcard_ids = $wpdb->get_col(
+        "SELECT ID FROM {$wpdb->posts} WHERE post_type = 'page' AND (post_name LIKE 'wpforms-%' OR post_name LIKE 'funnel-%')"
+    );
+    $exclude_ids = array_map('intval', array_unique(array_merge($exclude_ids, $wildcard_ids)));
+
+    $query_args = [
+        'post_type'      => 'page',
+        'post_status'    => $include_drafts ? ['publish', 'draft', 'pending', 'private', 'future'] : 'publish',
+        'posts_per_page' => $per_page,
+        'paged'          => $page,
+        'orderby'        => 'ID',
+        'order'          => 'ASC',
+    ];
+    if (!empty($exclude_ids)) {
+        $query_args['post__not_in'] = $exclude_ids;
+    }
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
+    $total = $query->found_posts;
+    $items = [];
+
+    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
+
+    foreach ($query->posts as $post) {
+        $featured_id  = get_post_thumbnail_id($post->ID);
+        $featured_url = $featured_id ? wp_get_attachment_url($featured_id) : '';
+
+        $all_meta  = get_post_meta($post->ID);
+        $flat_meta = [];
+        foreach ($all_meta as $key => $values) {
+            $flat_meta[$key] = count($values) === 1
+                ? maybe_unserialize($values[0])
+                : array_map('maybe_unserialize', $values);
+        }
+
+        $template = get_page_template_slug($post->ID) ?: 'default';
+
+        $items[] = [
+            'id'             => $post->ID,
+            'title'          => $post->post_title,
+            'slug'           => $post->post_name,
+            'status'         => $post->post_status,
+            // Resolve shortcodes/Divi so the consumer gets renderable HTML.
+            'content'        => apply_filters('the_content', $post->post_content),
+            'excerpt'        => $post->post_excerpt,
+            'parent_id'      => (int) $post->post_parent,
+            'menu_order'     => (int) $post->menu_order,
+            'template'       => $template,
+            'date_created'   => $post->post_date,
+            'date_modified'  => $post->post_modified,
+            'author_id'      => (int) $post->post_author,
+            'featured_image' => ['id' => $featured_id, 'url' => $featured_url],
+            'aioseo'         => $aioseo_map[$post->ID] ?? null,
+            'meta'           => $flat_meta,
+        ];
+    }
+
+    wp_reset_postdata();
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
+}
+
+
+// ── MENUS ────────────────────────────────────
+
+function bb_api_get_menus(WP_REST_Request $request): WP_REST_Response {
+    $locations_map = get_nav_menu_locations();
+    // Normalize to [location => menu_id], skipping unassigned (id=0) slots.
+    $locations = [];
+    foreach ($locations_map as $loc => $menu_id) {
+        if ((int) $menu_id > 0) $locations[$loc] = (int) $menu_id;
+    }
+
+    $menus = [];
+    foreach (wp_get_nav_menus() as $menu) {
+        /** @var WP_Term $menu */
+        $raw_items = wp_get_nav_menu_items($menu->term_id, ['update_post_term_cache' => false]) ?: [];
+
+        $items = [];
+        foreach ($raw_items as $item) {
+            $items[] = [
+                'id'          => (int) $item->ID,
+                'title'       => $item->title,
+                'url'         => $item->url,
+                'target'      => $item->target,
+                'type'        => $item->type,
+                'object'      => $item->object,
+                'object_id'   => (int) $item->object_id,
+                'parent'      => (int) $item->menu_item_parent,
+                'order'       => (int) $item->menu_order,
+                'classes'     => array_values(array_filter((array) $item->classes)),
+                'description' => $item->description,
+                'xfn'         => $item->xfn,
+            ];
+        }
+
+        $menus[] = [
+            'id'    => (int) $menu->term_id,
+            'name'  => $menu->name,
+            'slug'  => $menu->slug,
+            'items' => $items,
+        ];
+    }
+
+    return new WP_REST_Response([
+        'locations' => (object) $locations,
+        'menus'     => $menus,
+    ]);
+}
+
+
+// ── MEDIA ────────────────────────────────────
+
+function bb_api_get_media(WP_REST_Request $request): WP_REST_Response|WP_Error {
+    ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $query_args = [
+        'post_type'      => 'attachment',
+        'post_status'    => 'inherit',
+        'posts_per_page' => $per_page,
+        'paged'          => $page,
+        'orderby'        => 'ID',
+        'order'          => 'ASC',
+    ];
+    $mime = $request->get_param('mime_type');
+    if (!empty($mime)) {
+        $query_args['post_mime_type'] = (string) $mime;
+    }
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
+    $total = $query->found_posts;
+    $items = [];
+
+    foreach ($query->posts as $post) {
+        $meta      = wp_get_attachment_metadata($post->ID) ?: [];
+        // wp_get_attachment_url honors Jetpack / Cloudflare URL rewrites via the standard filter.
+        $url       = wp_get_attachment_url($post->ID) ?: '';
+        $file_path = get_attached_file($post->ID) ?: '';
+
+        $filesize = 0;
+        if (!empty($meta['filesize'])) {
+            $filesize = (int) $meta['filesize'];
+        } elseif ($file_path && is_readable($file_path)) {
+            $filesize = (int) @filesize($file_path);
+        }
+
+        $items[] = [
+            'id'             => $post->ID,
+            'title'          => $post->post_title,
+            'filename'       => $file_path ? basename($file_path) : '',
+            'url'            => $url,
+            'mime_type'      => $post->post_mime_type,
+            // Spec: alt MUST come from _wp_attachment_image_alt meta.
+            'alt'            => (string) get_post_meta($post->ID, '_wp_attachment_image_alt', true),
+            'caption'        => $post->post_excerpt,
+            'description'    => $post->post_content,
+            'width'          => isset($meta['width']) ? (int) $meta['width'] : null,
+            'height'         => isset($meta['height']) ? (int) $meta['height'] : null,
+            'filesize'       => $filesize,
+            'parent_post_id' => (int) $post->post_parent,
+            'date_created'   => $post->post_date,
+            'date_modified'  => $post->post_modified,
+        ];
+    }
+
+    wp_reset_postdata();
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
+}
+
+
+// ── TERMS ────────────────────────────────────
+
+function bb_api_get_terms(WP_REST_Request $request): WP_REST_Response|WP_Error {
+    ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    $taxonomy = trim((string) $request->get_param('taxonomy'));
+    if ($taxonomy === '' || !taxonomy_exists($taxonomy)) {
+        return new WP_Error(
+            'bb_api_invalid_taxonomy',
+            'Unknown or missing taxonomy. Pass ?taxonomy=product_cat (or similar registered taxonomy).',
+            ['status' => 400]
+        );
+    }
+
+    $count = wp_count_terms(['taxonomy' => $taxonomy, 'hide_empty' => false]);
+    $total = is_wp_error($count) ? 0 : (int) $count;
+
+    $terms = get_terms([
+        'taxonomy'   => $taxonomy,
+        'hide_empty' => false,
+        'number'     => $per_page,
+        'offset'     => ($page - 1) * $per_page,
+        'orderby'    => 'term_id',
+        'order'      => 'ASC',
+    ]);
+    if (is_wp_error($terms)) {
+        return $terms;
+    }
+
+    $term_ids   = array_map(static fn ($t) => (int) $t->term_id, $terms);
+    $aioseo_map = bb_api_fetch_aioseo_for_terms($term_ids);
+
+    $items = [];
+    foreach ($terms as $term) {
+        /** @var WP_Term $term */
+        $all_meta  = get_term_meta($term->term_id);
+        $flat_meta = [];
+        foreach ($all_meta as $key => $values) {
+            $flat_meta[$key] = count($values) === 1
+                ? maybe_unserialize($values[0])
+                : array_map('maybe_unserialize', $values);
+        }
+
+        // Featured image: Woo's product_cat uses `thumbnail_id`; Yoast/other taxonomies reuse the same key.
+        $thumb_id  = (int) ($flat_meta['thumbnail_id'] ?? 0);
+        $thumb_url = $thumb_id ? wp_get_attachment_url($thumb_id) : '';
+
+        $items[] = [
+            'id'             => (int) $term->term_id,
+            'taxonomy'       => $term->taxonomy,
+            'name'           => $term->name,
+            'slug'           => $term->slug,
+            'parent_id'      => (int) $term->parent,
+            'description'    => $term->description,
+            'count'          => (int) $term->count,
+            'featured_image' => ['id' => $thumb_id, 'url' => $thumb_url ?: ''],
+            'aioseo'         => $aioseo_map[(int) $term->term_id] ?? null,
+            'meta'           => $flat_meta,
+        ];
+    }
+
+    // Note: core taxonomy terms have no `term_modified` column, so modified_after is
+    // accepted (for API symmetry) but cannot filter here. Last-Modified is also omitted.
     return bb_api_paginated_response($items, $total, $page, $per_page);
+}
+
+/**
+ * Bulk-fetch AIOSEO term rows. Mirrors bb_api_fetch_aioseo_for_posts; null-safe.
+ */
+function bb_api_fetch_aioseo_for_terms(array $term_ids): array {
+    $term_ids = array_values(array_unique(array_filter(array_map('intval', $term_ids))));
+    if (empty($term_ids)) return [];
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'aioseo_terms';
+
+    $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+    if ($exists !== $table) return [];
+
+    $placeholders = implode(',', array_fill(0, count($term_ids), '%d'));
+    $rows = $wpdb->get_results(
+        $wpdb->prepare("SELECT * FROM $table WHERE term_id IN ($placeholders)", ...$term_ids),
+        ARRAY_A
+    );
+
+    $map = [];
+    foreach ($rows ?: [] as $row) {
+        // Reuse the post formatter: overlapping columns (title/description/og_*/schema_*) carry over;
+        // non-applicable fields are simply null for terms.
+        $row['post_id']   = (int) ($row['term_id'] ?? 0);
+        $row['post_type'] = 'term';
+        $map[(int) ($row['term_id'] ?? 0)] = bb_api_format_aioseo_row($row);
+    }
+    return $map;
+}
+
+
+// ── COUPONS ──────────────────────────────────
+
+function bb_api_get_coupons(WP_REST_Request $request): WP_REST_Response|WP_Error {
+    ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
+
+    $modified_after = bb_api_parse_modified_after($request);
+    if ($modified_after instanceof WP_Error) return $modified_after;
+
+    if (!function_exists('wc_get_coupon') && !class_exists('WC_Coupon')) {
+        return new WP_Error('bb_api_no_woocommerce', 'WooCommerce is not active.', ['status' => 503]);
+    }
+
+    $status = (string) ($request->get_param('status') ?: 'publish');
+
+    $query_args = [
+        'post_type'      => 'shop_coupon',
+        'post_status'    => $status,
+        'posts_per_page' => $per_page,
+        'paged'          => $page,
+        'orderby'        => 'ID',
+        'order'          => 'ASC',
+    ];
+    if ($modified_after instanceof DateTimeImmutable) {
+        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+    }
+
+    $query = new WP_Query($query_args);
+    $total = $query->found_posts;
+    $items = [];
+
+    foreach ($query->posts as $post) {
+        $coupon = new WC_Coupon($post->ID);
+        if (!$coupon || !$coupon->get_id()) continue;
+
+        $items[] = [
+            'id'                          => $coupon->get_id(),
+            'code'                        => $coupon->get_code(),
+            'description'                 => $coupon->get_description(),
+            'discount_type'               => $coupon->get_discount_type(),
+            'amount'                      => $coupon->get_amount(),
+            'date_expires'                => $coupon->get_date_expires()?->format('c'),
+            'date_created'                => $coupon->get_date_created()?->format('c'),
+            'date_modified'               => $coupon->get_date_modified()?->format('c'),
+            'usage_count'                 => (int) $coupon->get_usage_count(),
+            'usage_limit'                 => $coupon->get_usage_limit() ?: null,
+            'usage_limit_per_user'        => $coupon->get_usage_limit_per_user() ?: null,
+            'individual_use'              => (bool) $coupon->get_individual_use(),
+            'minimum_amount'              => $coupon->get_minimum_amount(),
+            'maximum_amount'              => $coupon->get_maximum_amount(),
+            'email_restrictions'          => $coupon->get_email_restrictions(),
+            'product_ids'                 => array_map('intval', $coupon->get_product_ids()),
+            'excluded_product_ids'        => array_map('intval', $coupon->get_excluded_product_ids()),
+            'product_categories'          => array_map('intval', $coupon->get_product_categories()),
+            'excluded_product_categories' => array_map('intval', $coupon->get_excluded_product_categories()),
+            'exclude_sale_items'          => (bool) $coupon->get_exclude_sale_items(),
+            'free_shipping'               => (bool) $coupon->get_free_shipping(),
+            'meta_data'                   => $coupon->get_meta_data(),
+        ];
+    }
+
+    wp_reset_postdata();
+    return bb_api_paginated_response(
+        $items,
+        $total,
+        $page,
+        $per_page,
+        $request,
+        bb_api_max_modified($items, 'date_modified')
+    );
+}
+
+
+// ── AIOSEO single-row lookup ─────────────────
+
+function bb_api_get_aioseo_for_post(WP_REST_Request $request): WP_REST_Response|WP_Error {
+    $post_type = (string) $request->get_param('post_type');
+    $post_id   = (int) $request->get_param('id');
+
+    if ($post_id <= 0) {
+        return new WP_Error('bb_api_invalid_id', 'id must be a positive integer.', ['status' => 400]);
+    }
+
+    global $wpdb;
+    $table  = $wpdb->prefix . 'aioseo_posts';
+    $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table));
+    if ($exists !== $table) {
+        return new WP_Error('bb_api_aioseo_missing', 'AIOSEO is not installed.', ['status' => 404]);
+    }
+
+    $row = $wpdb->get_row(
+        $wpdb->prepare("SELECT * FROM $table WHERE post_id = %d AND post_type = %s LIMIT 1", $post_id, $post_type),
+        ARRAY_A
+    );
+    if (!$row) {
+        return new WP_Error('bb_api_aioseo_not_found', 'No AIOSEO row found for that post.', ['status' => 404]);
+    }
+
+    return new WP_REST_Response(bb_api_format_aioseo_row($row));
 }
