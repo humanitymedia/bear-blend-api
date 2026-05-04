@@ -3,7 +3,7 @@
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
  * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
- * Version:     1.1.3
+ * Version:     1.1.4
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -1123,40 +1123,68 @@ function bb_api_get_products(WP_REST_Request $request): WP_REST_Response|WP_Erro
 
 // ── HERBS ────────────────────────────────────
 
+/**
+ * Detect the post type that stores the herb encyclopedia entries.
+ *
+ * Bear Blend's theme registers Divi's "project" CPT with rewrite slug 'herbs'
+ * and relabels it "Herbs" — so the literal `herb`/`herbs` post type name does
+ * not exist. We detect by rewrite slug as a fallback.
+ *
+ * Returns null if no plausible CPT is registered (caller should then try a
+ * page-tree fallback or return empty).
+ */
+function bb_api_detect_herb_post_type(): ?string {
+    $registered = get_post_types([], 'names');
+    foreach (['herb', 'herbs'] as $literal) {
+        if (in_array($literal, $registered, true)) return $literal;
+    }
+    foreach (get_post_types([], 'objects') as $name => $obj) {
+        if ($name === 'page' || $name === 'post' || $name === 'attachment') continue;
+        $rewrite = $obj->rewrite ?? false;
+        if (is_array($rewrite) && ($rewrite['slug'] ?? null) === 'herbs') {
+            return $name;
+        }
+    }
+    return null;
+}
+
+/**
+ * Recursively reduce ACF return values so post_object / relationship fields
+ * carry IDs instead of full WP_Post instances. Keeps JSON compact and avoids
+ * leaking unrelated post payloads into the response.
+ */
+function bb_api_reduce_acf_post_refs(mixed $value): mixed {
+    if ($value instanceof WP_Post) return (int) $value->ID;
+    if (is_array($value)) {
+        $out = [];
+        foreach ($value as $k => $v) {
+            $out[$k] = bb_api_reduce_acf_post_refs($v);
+        }
+        return $out;
+    }
+    return $value;
+}
+
 function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
     ['page' => $page, 'per_page' => $per_page] = bb_api_pagination_args($request);
 
     $modified_after = bb_api_parse_modified_after($request);
     if ($modified_after instanceof WP_Error) return $modified_after;
 
-    // Herbs may be stored as a custom post type or as pages — try both
-    $post_types = ['herb', 'herbs'];
-    $registered = get_post_types([], 'names');
-
-    // Find the actual herb post type, fallback to page
-    $herb_type = 'page';
-    foreach ($post_types as $candidate) {
-        if (in_array($candidate, $registered, true)) {
-            $herb_type = $candidate;
-            break;
-        }
-    }
+    $herb_type = bb_api_detect_herb_post_type();
 
     // Slugs that should never appear in herb results (site utility pages, etc.)
+    // Only relevant when falling back to the page tree.
     $excluded_slugs = [
         'shop', 'cart', 'checkout', 'contact', 'reviews', 'thankyou',
         'disclaimer', 'admin-panel', 'bear-blog', 'shopping-cart',
         'ingredients', 'where-did-it-come-from',
     ];
 
-    // If using pages, require the parent page whose slug is exactly "herbs".
-    // If that page cannot be found, return nothing rather than dumping all pages.
     $parent_id = 0;
-    if ($herb_type === 'page') {
-        // get_page_by_path() only matches published pages with post_parent=0 by default.
-        // On live, the herbs page was either nested, non-published, or the cache was cold —
-        // so we fall back to a direct wpdb lookup that tolerates any non-trash status and
-        // ranks 'publish' first when multiple candidates exist.
+    if ($herb_type === null) {
+        // No herb CPT registered — fall back to pages whose parent has slug "herbs".
+        $herb_type  = 'page';
         $herbs_page = get_page_by_path('herbs');
         if ($herbs_page && $herbs_page->post_name === 'herbs') {
             $parent_id = $herbs_page->ID;
@@ -1231,10 +1259,22 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
         $featured_id  = get_post_thumbnail_id($post->ID);
         $featured_url = $featured_id ? wp_get_attachment_url($featured_id) : '';
 
-        // ACF fields if available
+        // ACF fields if available. ACF returns relationship/post-object fields as
+        // full WP_Post instances, which bloat JSON and break json_encode for some
+        // edge cases. Reduce them to IDs.
         $acf_fields = [];
         if (function_exists('get_fields')) {
             $acf_fields = get_fields($post->ID) ?: [];
+            $acf_fields = bb_api_reduce_acf_post_refs($acf_fields);
+        }
+
+        // Related products (herbs_products is the ACF field used by the theme's
+        // hm_individual_herbs shortcode). Surface as a flat ID list for Laravel.
+        $related_product_ids = [];
+        if (isset($acf_fields['herbs_products'])) {
+            $related_product_ids = is_array($acf_fields['herbs_products'])
+                ? array_values(array_filter(array_map('intval', $acf_fields['herbs_products'])))
+                : [];
         }
 
         // Taxonomies
@@ -1250,19 +1290,20 @@ function bb_api_get_herbs(WP_REST_Request $request): WP_REST_Response|WP_Error {
         }
 
         $items[] = [
-            'id'              => $post->ID,
-            'title'           => $post->post_title,
-            'slug'            => $post->post_name,
-            'status'          => $post->post_status,
-            'content'         => bb_api_render_post_content($post->post_content, $post->ID),
-            'excerpt'         => $post->post_excerpt,
-            'date_created'    => $post->post_date,
-            'date_modified'   => $post->post_modified,
-            'featured_image'  => ['id' => $featured_id, 'url' => $featured_url],
-            'acf_fields'      => $acf_fields,
-            'taxonomies'      => $taxonomies,
-            'aioseo'          => $aioseo_map[$post->ID] ?? null,
-            'meta'            => $flat_meta,
+            'id'                  => $post->ID,
+            'title'               => $post->post_title,
+            'slug'                => $post->post_name,
+            'status'              => $post->post_status,
+            'content'             => bb_api_render_post_content($post->post_content, $post->ID),
+            'excerpt'             => $post->post_excerpt,
+            'date_created'        => $post->post_date,
+            'date_modified'       => $post->post_modified,
+            'featured_image'      => ['id' => $featured_id, 'url' => $featured_url],
+            'acf_fields'          => $acf_fields,
+            'related_product_ids' => $related_product_ids,
+            'taxonomies'          => $taxonomies,
+            'aioseo'              => $aioseo_map[$post->ID] ?? null,
+            'meta'                => $flat_meta,
         ];
     }
 
@@ -1521,7 +1562,7 @@ function bb_api_get_counts(WP_REST_Request $request): WP_REST_Response {
 
     $registered = get_post_types([], 'names');
     $faq_type   = in_array('faq', $registered, true) ? 'faq' : (in_array('faqs', $registered, true) ? 'faqs' : null);
-    $herb_type  = in_array('herb', $registered, true) ? 'herb' : (in_array('herbs', $registered, true) ? 'herbs' : null);
+    $herb_type  = bb_api_detect_herb_post_type();
 
     $users_total = (int) (count_users()['total_users'] ?? 0);
 
