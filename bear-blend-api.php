@@ -3,7 +3,7 @@
  * Plugin Name: Bear Blend API
  * Plugin URI:  https://bearblend.com
  * Description: Read-only REST API endpoints for migrating and syncing Bear Blend site data to Laravel. Exposes customers, orders, products, herbs, posts, pages, menus, media, terms, coupons, counts, and AIOSEO metadata — all paginated (where applicable), protected by a Bearer token, and supporting incremental sync via ?modified_after.
- * Version:     1.1.4
+ * Version:     1.2.0
  * Author:      Bear Blend
  * Requires PHP: 8.2
  * Requires at least: 6.0
@@ -11,6 +11,8 @@
  */
 
 defined('ABSPATH') || exit;
+
+require_once __DIR__ . '/inventory-routes.php';
 
 // ──────────────────────────────────────────────
 // 1. ADMIN SETTINGS PAGE
