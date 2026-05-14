@@ -77,6 +77,13 @@ function bb_api_settings_page(): void {
                 <tr><td>GET</td><td><code>/wp-json/bb/v1/terms</code></td><td>Taxonomy terms with descriptions &amp; AIOSEO (<code>?taxonomy=</code> required)</td></tr>
                 <tr><td>GET</td><td><code>/wp-json/bb/v1/coupons</code></td><td>WooCommerce coupons with restrictions &amp; usage counts</td></tr>
                 <tr><td>GET</td><td><code>/wp-json/bb/v1/aioseo/{post_type}/{id}</code></td><td>Direct AIOSEO row lookup for a single post (optional helper)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/items</code></td><td>Inventory items (CPT) with ACF, nested lots, recipe, vendors, SKUs</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/vendors</code></td><td>Vendor CPT with contacts and invoices</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/receiving</code></td><td>Receiving logs (Formidable form 3)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/adjustments</code></td><td>Inventory adjustments (Formidable form 4)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/assemblies</code></td><td>Assemblies (form 5) with nested ingredients (form 6)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/shipping-logs</code></td><td>Shipping logs (Formidable form 11)</td></tr>
+                <tr><td>GET</td><td><code>/wp-json/bb/v1/inventory/purchase-orders</code></td><td>Purchase orders (form 16) with nested line items (form 17)</td></tr>
             </tbody>
         </table>
         <p>All list endpoints accept <code>?page=1&amp;per_page=50</code> and <code>?modified_after=&lt;ISO 8601 UTC&gt;</code> for incremental sync. Paginated responses return <code>X-WP-Total</code>, <code>X-WP-TotalPages</code>, <code>Last-Modified</code>, and <code>ETag</code> headers; send <code>If-None-Match</code> to get a <code>304 Not Modified</code>.</p>
