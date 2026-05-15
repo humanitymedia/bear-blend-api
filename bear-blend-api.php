@@ -972,26 +972,31 @@ function bb_api_get_products(WP_REST_Request $request): WP_REST_Response|WP_Erro
     $modified_after = bb_api_parse_modified_after($request);
     if ($modified_after instanceof WP_Error) return $modified_after;
 
-    $query_args = [
-        'post_type'      => 'product',
-        'post_status'    => 'any',
-        'posts_per_page' => $per_page,
-        'paged'          => $page,
-        'orderby'        => 'ID',
-        'order'          => 'ASC',
-    ];
+    // Query products via $wpdb instead of WP_Query so plugin pre_get_posts
+    // hooks cannot strip rows. WC Wholesale Pricing's visitor filter excludes
+    // any product with _wwp_hide_for_visitor=yes from unauthenticated WP_Query
+    // calls — which is exactly what our REST handler is. That filter was
+    // silently dropping 9 products (47 reviews) from the migration feed.
+    global $wpdb;
+    $where  = "post_type = 'product' AND post_status NOT IN ('trash', 'auto-draft')";
+    $params = [];
     if ($modified_after instanceof DateTimeImmutable) {
-        $query_args['date_query'] = bb_api_date_query_post_modified($modified_after);
+        $where    .= ' AND post_modified_gmt > %s';
+        $params[]  = $modified_after->format('Y-m-d H:i:s');
     }
+    $params[] = $per_page;
+    $params[] = ($page - 1) * $per_page;
 
-    $query = new WP_Query($query_args);
+    $sql = "SELECT SQL_CALC_FOUND_ROWS ID FROM {$wpdb->posts} WHERE {$where} ORDER BY ID ASC LIMIT %d OFFSET %d";
+    $post_ids = $wpdb->get_col($wpdb->prepare($sql, $params));
+    $total    = (int) $wpdb->get_var('SELECT FOUND_ROWS()');
 
-    $total = $query->found_posts;
     $items = [];
+    $aioseo_map = bb_api_fetch_aioseo_for_posts($post_ids);
 
-    $aioseo_map = bb_api_fetch_aioseo_for_posts(wp_list_pluck($query->posts, 'ID'));
-
-    foreach ($query->posts as $post) {
+    foreach ($post_ids as $post_id) {
+        $post = get_post($post_id);
+        if (!$post) continue;
         $product = wc_get_product($post->ID);
         if (!$product) continue;
 
@@ -1049,12 +1054,15 @@ function bb_api_get_products(WP_REST_Request $request): WP_REST_Response|WP_Erro
             }
         }
 
-        // Reviews
+        // Reviews — include approved AND pending so callers can preserve the
+        // moderation queue. Spam/trash are excluded. Status is returned in
+        // the WP-internal form ('1' = approved, '0' = pending) so the caller
+        // can map to its own schema.
         $reviews    = [];
         $comments   = get_comments([
             'post_id' => $post->ID,
             'type'    => 'review',
-            'status'  => 'approve',
+            'status'  => array('approve', 'hold'),
         ]);
         foreach ($comments as $comment) {
             $reviews[] = [
@@ -1064,6 +1072,7 @@ function bb_api_get_products(WP_REST_Request $request): WP_REST_Response|WP_Erro
                 'rating'   => (int) get_comment_meta($comment->comment_ID, 'rating', true),
                 'content'  => $comment->comment_content,
                 'date'     => $comment->comment_date,
+                'status'   => $comment->comment_approved,
             ];
         }
 
